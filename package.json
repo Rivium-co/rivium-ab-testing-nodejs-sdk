@@ -1,0 +1,50 @@
+{
+  "name": "rivium-ab-testing-node",
+  "version": "0.1.0",
+  "description": "Rivium A/B Testing SDK for Node.js - Server-side experiments, feature flags, and event tracking",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "type-check": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "nodejs",
+    "ab-testing",
+    "rivium",
+    "experiments",
+    "feature-flags",
+    "server-side"
+  ],
+  "author": "Rivium <founder@rivium.co>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rivium-co/rivium-ab-testing-nodejs-sdk.git"
+  },
+  "homepage": "https://github.com/Rivium-co/rivium-ab-testing-nodejs-sdk",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

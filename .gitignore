@@ -1,0 +1,21 @@
+# Claude
+.claude/
+
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Example
+example/node_modules/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*

@@ -1,0 +1,14 @@
+{
+  "name": "rivium-ab-testing-node-example",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "npx tsx index.ts"
+  },
+  "dependencies": {
+    "rivium-ab-testing-node": "file:.."
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}
