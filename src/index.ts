@@ -1,6 +1,8 @@
 import { createHash } from './hash';
 
 const API_URL = 'https://abtest.rivium.co';
+const AUTH_URL = 'https://auth.rivium.co';
+const SDK_VERSION = '0.2.0';
 
 // ============================================
 // TYPES & INTERFACES
@@ -9,9 +11,24 @@ const API_URL = 'https://abtest.rivium.co';
 export interface RiviumAbTestingConfig {
   /** API key for authentication (format: rv_live_xxx or rv_test_xxx) */
   apiKey: string;
+  /**
+   * Your project's server secret. This SDK runs on your server, so it can
+   * prove that with the secret; the service then trusts the user ids you pass,
+   * even when the project requires signed user tokens. Keep it on the server:
+   * never put it in an app or a browser bundle.
+   */
+  serverSecret?: string;
   debug?: boolean;
+  /** How often queued events are sent, in milliseconds. Default 30000. */
   flushInterval?: number;
+  /** Most events kept in memory while waiting to be sent. Default 1000. */
   maxQueueSize?: number;
+  /**
+   * Most (user, experiment) assignments kept in memory. A server sees many
+   * users, so the cache is bounded; the oldest entries are dropped first.
+   * Default 10000.
+   */
+  maxCachedAssignments?: number;
 }
 
 export interface Experiment {
@@ -57,6 +74,13 @@ export interface FlagVariant {
   weight: number;
 }
 
+export interface UserToken {
+  token: string;
+  userId: string;
+  /** Seconds until the token expires. */
+  expiresIn: number;
+}
+
 export enum EventType {
   VIEW = 'view',
   CLICK = 'click',
@@ -96,6 +120,17 @@ type EventCallback = (event: RiviumAbTestingEvent) => void;
 // INTERNAL TYPES
 // ============================================
 
+interface UserContext {
+  userId: string;
+  attributes: Record<string, unknown>;
+}
+
+interface TrackOptions {
+  eventName?: string;
+  eventValue?: number;
+  metadata?: Record<string, unknown>;
+}
+
 interface QueuedEvent {
   id: string;
   experimentId: string;
@@ -106,50 +141,261 @@ interface QueuedEvent {
   eventValue?: number;
   metadata?: Record<string, unknown>;
   timestamp: string;
-  retryCount: number;
 }
 
 interface CachedAssignment {
   experimentId: string;
   variantId: string;
   variantName: string;
-  assignedAt: string;
+  config?: Record<string, unknown>;
 }
 
 interface CachedExperiment {
   id: string;
+  key: string;
   name: string;
   trafficAllocation: number;
   variants: {
     id: string;
+    key?: string;
     name: string;
     config?: Record<string, unknown>;
     isControl: boolean;
     trafficSplit: number;
   }[];
-  cachedAt: string;
 }
 
 interface SyncConfig {
   syncIntervalSeconds: number;
   maxBatchSize: number;
   maxOfflineEvents: number;
-  maxRetries: number;
+}
+
+function withProperties(
+  extra: Record<string, unknown>,
+  properties?: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const metadata = { ...extra, ...properties };
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+// ============================================
+// USER-FACING API (shared by the SDK and per-user handles)
+// ============================================
+
+/**
+ * Everything that acts on behalf of one user. `RiviumAbTesting.forUser(id)`
+ * returns one bound to that user; the SDK object itself acts for the user set
+ * with `setUserId` (fine for scripts and single-user processes, but on a
+ * server handling many users at once use `forUser`, once per request).
+ */
+export abstract class RiviumAbTestingClient {
+  /** @internal */
+  protected abstract sdk(): RiviumAbTestingSDK;
+  /** @internal */
+  protected abstract user(): UserContext;
+
+  getVariant(experimentKey: string, defaultVariant: string = 'control'): Promise<string> {
+    return this.sdk()._getVariant(this.user(), experimentKey, defaultVariant);
+  }
+
+  getVariantConfig(experimentKey: string): Promise<Record<string, unknown> | null> {
+    return this.sdk()._getVariantConfig(this.user(), experimentKey);
+  }
+
+  isFeatureEnabled(featureKey: string, defaultValue: boolean = false): Promise<boolean> {
+    return this.sdk()
+      ._evaluateFlag(this.user(), featureKey)
+      .then((data) => (data?.enabled as boolean | undefined) ?? defaultValue);
+  }
+
+  getFeatureValue(featureKey: string, defaultValue?: unknown): Promise<unknown> {
+    return this.sdk()
+      ._evaluateFlag(this.user(), featureKey)
+      .then((data) => data?.value ?? defaultValue);
+  }
+
+  // Core events
+
+  trackView(experimentKey: string): Promise<void> {
+    return this.track(experimentKey, EventType.VIEW);
+  }
+
+  trackClick(experimentKey: string): Promise<void> {
+    return this.track(experimentKey, EventType.CLICK);
+  }
+
+  trackConversion(experimentKey: string, value?: number): Promise<void> {
+    return this.track(experimentKey, EventType.CONVERSION, { eventValue: value });
+  }
+
+  trackCustomEvent(
+    experimentKey: string,
+    eventName: string,
+    properties?: Record<string, unknown>
+  ): Promise<void> {
+    return this.track(experimentKey, EventType.CUSTOM, { eventName, metadata: properties });
+  }
+
+  // Engagement events
+
+  trackScroll(experimentKey: string, depth?: number, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.SCROLL, { eventValue: depth, metadata: properties });
+  }
+
+  trackFormSubmit(experimentKey: string, formName?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.FORM_SUBMIT, { eventName: formName, metadata: properties });
+  }
+
+  trackSearch(experimentKey: string, query?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.SEARCH, {
+      metadata: withProperties(query ? { query } : {}, properties),
+    });
+  }
+
+  trackShare(experimentKey: string, method?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.SHARE, {
+      metadata: withProperties(method ? { method } : {}, properties),
+    });
+  }
+
+  // E-commerce events
+
+  trackAddToCart(
+    experimentKey: string,
+    value?: number,
+    productId?: string,
+    properties?: Record<string, unknown>
+  ): Promise<void> {
+    return this.track(experimentKey, EventType.ADD_TO_CART, {
+      eventValue: value,
+      metadata: withProperties(productId ? { productId } : {}, properties),
+    });
+  }
+
+  trackRemoveFromCart(
+    experimentKey: string,
+    value?: number,
+    productId?: string,
+    properties?: Record<string, unknown>
+  ): Promise<void> {
+    return this.track(experimentKey, EventType.REMOVE_FROM_CART, {
+      eventValue: value,
+      metadata: withProperties(productId ? { productId } : {}, properties),
+    });
+  }
+
+  trackBeginCheckout(experimentKey: string, value?: number, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.BEGIN_CHECKOUT, { eventValue: value, metadata: properties });
+  }
+
+  trackPurchase(
+    experimentKey: string,
+    value: number,
+    transactionId?: string,
+    properties?: Record<string, unknown>
+  ): Promise<void> {
+    return this.track(experimentKey, EventType.PURCHASE, {
+      eventValue: value,
+      metadata: withProperties(transactionId ? { transactionId } : {}, properties),
+    });
+  }
+
+  // Media events
+
+  trackVideoStart(experimentKey: string, videoId?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.VIDEO_START, {
+      metadata: withProperties(videoId ? { videoId } : {}, properties),
+    });
+  }
+
+  trackVideoComplete(experimentKey: string, videoId?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.VIDEO_COMPLETE, {
+      metadata: withProperties(videoId ? { videoId } : {}, properties),
+    });
+  }
+
+  // User auth events
+
+  trackSignUp(experimentKey: string, method?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.SIGN_UP, {
+      metadata: withProperties(method ? { method } : {}, properties),
+    });
+  }
+
+  trackLogin(experimentKey: string, method?: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.LOGIN, {
+      metadata: withProperties(method ? { method } : {}, properties),
+    });
+  }
+
+  trackLogout(experimentKey: string, properties?: Record<string, unknown>): Promise<void> {
+    return this.track(experimentKey, EventType.LOGOUT, { metadata: properties });
+  }
+
+  // Generic
+
+  trackEvent(
+    experimentKey: string,
+    eventType: EventType,
+    eventName?: string,
+    value?: number,
+    properties?: Record<string, unknown>
+  ): Promise<void> {
+    return this.track(experimentKey, eventType, {
+      eventName: eventName || eventType,
+      eventValue: value,
+      metadata: properties,
+    });
+  }
+
+  private track(experimentKey: string, eventType: EventType, options?: TrackOptions): Promise<void> {
+    return this.sdk()._track(this.user(), experimentKey, eventType, options);
+  }
+}
+
+/** One user's view of the SDK. Cheap to create; make one per request. */
+export class RiviumAbTestingUser extends RiviumAbTestingClient {
+  private readonly context: UserContext;
+
+  /** @internal */
+  constructor(private readonly owner: RiviumAbTestingSDK, userId: string, attributes: Record<string, unknown>) {
+    super();
+    this.context = { userId, attributes: { ...attributes } };
+  }
+
+  get userId(): string {
+    return this.context.userId;
+  }
+
+  /** @internal */
+  protected sdk(): RiviumAbTestingSDK {
+    return this.owner;
+  }
+
+  /** @internal */
+  protected user(): UserContext {
+    return this.context;
+  }
 }
 
 // ============================================
 // SDK IMPLEMENTATION
 // ============================================
 
-export class RiviumAbTestingSDK {
+export class RiviumAbTestingSDK extends RiviumAbTestingClient {
   private listeners: Map<string, EventCallback[]> = new Map();
   private isInitialized = false;
   private config: RiviumAbTestingConfig | null = null;
 
-  // State (in-memory)
+  // The user for the single-user methods (setUserId). Per-request code should
+  // use forUser() instead, which never touches this.
   private userId: string | null = null;
   private userAttributes: Record<string, unknown> = {};
+
   private cachedExperiments: CachedExperiment[] = [];
+  // Keyed by user AND experiment: one user's variant must never be served to
+  // another. Insertion-ordered, so the first key is the oldest.
   private assignments: Map<string, CachedAssignment> = new Map();
   private eventQueue: QueuedEvent[] = [];
 
@@ -160,7 +406,6 @@ export class RiviumAbTestingSDK {
     syncIntervalSeconds: 30,
     maxBatchSize: 100,
     maxOfflineEvents: 1000,
-    maxRetries: 3,
   };
 
   // ============================================
@@ -173,7 +418,8 @@ export class RiviumAbTestingSDK {
     this.config = config;
 
     const interval = config.flushInterval || 30000;
-    this.syncConfig.syncIntervalSeconds = Math.floor(interval / 1000);
+    this.syncConfig.syncIntervalSeconds = Math.max(1, Math.floor(interval / 1000));
+    if (config.maxQueueSize) this.syncConfig.maxOfflineEvents = config.maxQueueSize;
     this.startSyncTimer();
 
     this.isInitialized = true;
@@ -185,11 +431,34 @@ export class RiviumAbTestingSDK {
   }
 
   // ============================================
-  // USER MANAGEMENT
+  // USERS
   // ============================================
 
+  /**
+   * A handle that acts for one user. Use this on a server: create one per
+   * request with that request's user, and nothing leaks between users.
+   *
+   *   const user = RiviumAbTesting.forUser(req.user.id, { country: 'DE' });
+   *   const variant = await user.getVariant('checkout-button');
+   */
+  forUser(userId: string, attributes: Record<string, unknown> = {}): RiviumAbTestingUser {
+    this.ensureInitialized();
+    if (!userId) {
+      throw new Error('forUser() requires a userId');
+    }
+    return new RiviumAbTestingUser(this, userId, attributes);
+  }
+
+  /**
+   * Sets the user for the SDK's own methods. Only for single-user processes:
+   * on a server two requests would overwrite each other's user. Use forUser().
+   */
   setUserId(userId: string): void {
     this.ensureInitialized();
+    if (userId !== this.userId) {
+      // A different person now: their attributes are not the last user's.
+      this.userAttributes = {};
+    }
     this.userId = userId;
   }
 
@@ -203,342 +472,33 @@ export class RiviumAbTestingSDK {
     this.userAttributes = { ...this.userAttributes, ...attributes };
   }
 
-  // ============================================
-  // EXPERIMENT ASSIGNMENT
-  // ============================================
-
-  async getVariant(
-    experimentKey: string,
-    defaultVariant: string = 'control'
-  ): Promise<string> {
+  /**
+   * Mints a Rivium user token for one of your users, to hand to your app. The
+   * app SDKs send it so the service knows which user they act for. Requires
+   * `serverSecret`. The same token works for Rivium Chat and Sync.
+   *
+   *   app.post('/rivium-token', async (req, res) => {
+   *     res.json(await RiviumAbTesting.createUserToken(req.session.userId));
+   *   });
+   */
+  async createUserToken(userId: string, expiresIn?: number): Promise<UserToken> {
     this.ensureInitialized();
-    this.ensureUserId();
-
-    // Check cached assignment (sticky bucketing)
-    const cached = this.assignments.get(experimentKey);
-    if (cached) {
-      return cached.variantName;
+    if (!userId) {
+      throw new Error('createUserToken() requires a userId');
+    }
+    if (!this.config!.serverSecret) {
+      throw new Error('createUserToken() requires serverSecret in init()');
     }
 
-    // Try server assignment
-    try {
-      const response = await fetch(`${API_URL}/public/assign`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
-        body: JSON.stringify({
-          experimentId: experimentKey,
-          userId: this.userId,
-          context: this.userAttributes,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
-        const variantName = data.variantName as string;
-
-        this.assignments.set(experimentKey, {
-          experimentId: experimentKey,
-          variantId: data.variantId as string,
-          variantName,
-          assignedAt: new Date().toISOString(),
-        });
-
-        this.emit('experimentAssigned', {
-          experimentKey,
-          variantKey: variantName,
-          config: data.config,
-        });
-
-        return variantName;
-      }
-    } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get assignment from server:', e);
-      }
+    const response = await fetch(`${AUTH_URL}/users/token`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(expiresIn === undefined ? { userId } : { userId, expiresIn }),
+    });
+    if (!response.ok) {
+      throw new Error(`createUserToken failed: HTTP ${response.status}`);
     }
-
-    // Fallback: local bucketing
-    return this.getLocalAssignment(experimentKey, defaultVariant);
-  }
-
-  async getVariantConfig(
-    experimentKey: string
-  ): Promise<Record<string, unknown> | null> {
-    this.ensureInitialized();
-
-    try {
-      const response = await fetch(
-        `${API_URL}/public/variant-config?experimentId=${experimentKey}&userId=${this.userId}`,
-        {
-          headers: { 'x-api-key': this.config!.apiKey },
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
-        return (data.config as Record<string, unknown>) || null;
-      }
-    } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get variant config:', e);
-      }
-    }
-
-    // Fallback to cached
-    const experiment = this.cachedExperiments.find(
-      (exp) => exp.id === experimentKey || exp.name === experimentKey
-    );
-    if (experiment) {
-      const cached = this.assignments.get(experimentKey);
-      if (cached) {
-        const variant = experiment.variants.find(
-          (v) => v.id === cached.variantId
-        );
-        return variant?.config || null;
-      }
-    }
-
-    return null;
-  }
-
-  // ============================================
-  // CORE EVENT TRACKING
-  // ============================================
-
-  async trackView(experimentKey: string): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.VIEW);
-  }
-
-  async trackClick(experimentKey: string): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.CLICK);
-  }
-
-  async trackConversion(experimentKey: string, value?: number): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.CONVERSION, {
-      eventValue: value,
-    });
-  }
-
-  async trackCustomEvent(
-    experimentKey: string,
-    eventName: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.CUSTOM, {
-      eventName,
-      metadata: properties,
-    });
-  }
-
-  // ============================================
-  // ENGAGEMENT EVENTS
-  // ============================================
-
-  async trackScroll(
-    experimentKey: string,
-    depth?: number,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.SCROLL, {
-      eventValue: depth,
-      metadata: properties,
-    });
-  }
-
-  async trackFormSubmit(
-    experimentKey: string,
-    formName?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.FORM_SUBMIT, {
-      eventName: formName,
-      metadata: properties,
-    });
-  }
-
-  async trackSearch(
-    experimentKey: string,
-    query?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(query ? { query } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.SEARCH, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackShare(
-    experimentKey: string,
-    method?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(method ? { method } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.SHARE, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  // ============================================
-  // E-COMMERCE EVENTS
-  // ============================================
-
-  async trackAddToCart(
-    experimentKey: string,
-    value?: number,
-    productId?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(productId ? { productId } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.ADD_TO_CART, {
-      eventValue: value,
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackRemoveFromCart(
-    experimentKey: string,
-    value?: number,
-    productId?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(productId ? { productId } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.REMOVE_FROM_CART, {
-      eventValue: value,
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackBeginCheckout(
-    experimentKey: string,
-    value?: number,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.BEGIN_CHECKOUT, {
-      eventValue: value,
-      metadata: properties,
-    });
-  }
-
-  async trackPurchase(
-    experimentKey: string,
-    value: number,
-    transactionId?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(transactionId ? { transactionId } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.PURCHASE, {
-      eventValue: value,
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  // ============================================
-  // MEDIA EVENTS
-  // ============================================
-
-  async trackVideoStart(
-    experimentKey: string,
-    videoId?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(videoId ? { videoId } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.VIDEO_START, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackVideoComplete(
-    experimentKey: string,
-    videoId?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(videoId ? { videoId } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.VIDEO_COMPLETE, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  // ============================================
-  // USER AUTH EVENTS
-  // ============================================
-
-  async trackSignUp(
-    experimentKey: string,
-    method?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(method ? { method } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.SIGN_UP, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackLogin(
-    experimentKey: string,
-    method?: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    const metadata = {
-      ...(method ? { method } : {}),
-      ...properties,
-    };
-    await this.trackEventInternal(experimentKey, EventType.LOGIN, {
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
-  }
-
-  async trackLogout(
-    experimentKey: string,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, EventType.LOGOUT, {
-      metadata: properties,
-    });
-  }
-
-  // ============================================
-  // GENERIC EVENT TRACKING
-  // ============================================
-
-  async trackEvent(
-    experimentKey: string,
-    eventType: EventType,
-    eventName?: string,
-    value?: number,
-    properties?: Record<string, unknown>
-  ): Promise<void> {
-    await this.trackEventInternal(experimentKey, eventType, {
-      eventName: eventName || eventType,
-      eventValue: value,
-      metadata: properties,
-    });
+    return (await response.json()) as UserToken;
   }
 
   // ============================================
@@ -554,13 +514,13 @@ export class RiviumAbTestingSDK {
     this.ensureInitialized();
     return this.cachedExperiments.map((e) => ({
       id: e.id,
-      key: e.id,
+      key: e.key,
       name: e.name,
       status: 'running' as const,
       trafficAllocation: e.trafficAllocation,
       variants: e.variants.map((v) => ({
         id: v.id,
-        key: v.id,
+        key: v.key || v.id,
         name: v.name,
         trafficSplit: v.trafficSplit,
         isControl: v.isControl,
@@ -570,91 +530,20 @@ export class RiviumAbTestingSDK {
   }
 
   // ============================================
-  // FEATURE FLAGS
+  // FEATURE FLAGS (not user specific)
   // ============================================
-
-  async isFeatureEnabled(
-    featureKey: string,
-    defaultValue: boolean = false
-  ): Promise<boolean> {
-    this.ensureInitialized();
-
-    try {
-      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
-        body: JSON.stringify({
-          flagKey: featureKey,
-          userId: this.userId || '',
-          userAttributes: this.userAttributes,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
-        return (data.enabled as boolean) ?? defaultValue;
-      }
-    } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to check feature flag:', e);
-      }
-    }
-
-    return defaultValue;
-  }
-
-  async getFeatureValue(
-    featureKey: string,
-    defaultValue?: unknown
-  ): Promise<unknown> {
-    this.ensureInitialized();
-
-    try {
-      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
-        body: JSON.stringify({
-          flagKey: featureKey,
-          userId: this.userId || '',
-          userAttributes: this.userAttributes,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
-        return data.value ?? defaultValue;
-      }
-    } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get feature value:', e);
-      }
-    }
-
-    return defaultValue;
-  }
 
   async getFeatureFlags(): Promise<FeatureFlag[]> {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, {
-        headers: { 'x-api-key': this.config!.apiKey },
-      });
-
+      const response = await fetch(`${API_URL}/public/flags`, { headers: this.headers() });
       if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
+        const data = (await response.json()) as Record<string, unknown>;
         return (data.flags as FeatureFlag[]) || [];
       }
     } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get feature flags:', e);
-      }
+      this.debugLog('Failed to get feature flags:', e);
     }
 
     return [];
@@ -664,21 +553,14 @@ export class RiviumAbTestingSDK {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, {
-        headers: { 'x-api-key': this.config!.apiKey },
-      });
-
+      const response = await fetch(`${API_URL}/public/flags`, { headers: this.headers() });
       if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
+        const data = (await response.json()) as Record<string, unknown>;
         this.emit('featureFlagsRefreshed', data);
       }
     } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to refresh feature flags:', e);
-      }
-      this.emit('error', {
-        message: `Failed to refresh feature flags: ${e}`,
-      });
+      this.debugLog('Failed to refresh feature flags:', e);
+      this.emit('error', { message: `Failed to refresh feature flags: ${e}` });
     }
   }
 
@@ -702,12 +584,7 @@ export class RiviumAbTestingSDK {
       await this.syncEvents();
     }
 
-    this.userId = null;
-    this.userAttributes = {};
-    this.cachedExperiments = [];
-    this.assignments.clear();
-    this.eventQueue = [];
-    this.isInitialized = false;
+    this.clearState();
   }
 
   reset(): void {
@@ -715,13 +592,7 @@ export class RiviumAbTestingSDK {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
     }
-
-    this.userId = null;
-    this.userAttributes = {};
-    this.cachedExperiments = [];
-    this.assignments.clear();
-    this.eventQueue = [];
-    this.isInitialized = false;
+    this.clearState();
   }
 
   // ============================================
@@ -748,77 +619,153 @@ export class RiviumAbTestingSDK {
   }
 
   // ============================================
-  // PRIVATE: EVENT SYSTEM
+  // RiviumAbTestingClient: the SDK acts for setUserId's user
   // ============================================
 
-  private emit(event: RiviumAbTestingEventType, data: unknown): void {
-    const callbacks = this.listeners.get(event);
-    if (callbacks) {
-      callbacks.forEach((cb) => cb({ type: event, data }));
-    }
+  /** @internal */
+  protected sdk(): RiviumAbTestingSDK {
+    return this;
   }
 
-  // ============================================
-  // PRIVATE: VALIDATION
-  // ============================================
-
-  private ensureInitialized(): void {
-    if (!this.isInitialized) {
-      throw new Error(
-        'RiviumAbTesting SDK not initialized. Call init() first.'
-      );
-    }
-  }
-
-  private ensureUserId(): void {
+  /** @internal */
+  protected user(): UserContext {
+    this.ensureInitialized();
     if (!this.userId) {
-      throw new Error('User ID not set. Call setUserId() first.');
+      throw new Error('User ID not set. Call setUserId() first, or use forUser(userId).');
     }
+    return { userId: this.userId, attributes: this.userAttributes };
   }
 
   // ============================================
-  // PRIVATE: EVENT TRACKING
+  // INTERNAL: per-user operations (called by RiviumAbTestingClient)
   // ============================================
 
-  private async trackEventInternal(
+  /** @internal */
+  async _getVariant(user: UserContext, experimentKey: string, defaultVariant: string): Promise<string> {
+    this.ensureInitialized();
+
+    const cached = this.getCachedAssignment(user.userId, experimentKey);
+    if (cached) {
+      return cached.variantName;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/public/assign`, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          experimentKey,
+          userId: user.userId,
+          ...(Object.keys(user.attributes).length > 0 ? { userAttributes: user.attributes } : {}),
+        }),
+      });
+
+      if (response.ok) {
+        const body = (await response.json()) as { data?: Record<string, unknown> };
+        const data = body.data ?? {};
+        const variantName = (data.variantName as string) || (data.variantKey as string);
+
+        if (variantName) {
+          this.cacheAssignment(user.userId, experimentKey, {
+            experimentId: data.experimentId as string,
+            variantId: data.variantId as string,
+            variantName,
+            config: data.config as Record<string, unknown> | undefined,
+          });
+
+          this.emit('experimentAssigned', {
+            userId: user.userId,
+            experimentKey,
+            variantKey: variantName,
+            config: data.config,
+          });
+
+          return variantName;
+        }
+      } else {
+        this.debugLog(`Assignment for ${experimentKey} refused: HTTP ${response.status}`);
+      }
+    } catch (e) {
+      this.debugLog('Failed to get assignment from server:', e);
+    }
+
+    // Fallback: local bucketing
+    return this.getLocalAssignment(user, experimentKey, defaultVariant);
+  }
+
+  /** @internal */
+  async _getVariantConfig(user: UserContext, experimentKey: string): Promise<Record<string, unknown> | null> {
+    this.ensureInitialized();
+
+    // The assignment carries the variant's config; make sure there is one.
+    if (!this.getCachedAssignment(user.userId, experimentKey)) {
+      await this._getVariant(user, experimentKey, 'control');
+    }
+    const cached = this.getCachedAssignment(user.userId, experimentKey);
+    if (!cached) return null;
+    if (cached.config) return cached.config;
+
+    const experiment = this.findExperiment(experimentKey);
+    const variant = experiment?.variants.find((v) => v.id === cached.variantId);
+    return variant?.config || null;
+  }
+
+  /** @internal */
+  async _evaluateFlag(user: UserContext, featureKey: string): Promise<Record<string, unknown> | null> {
+    this.ensureInitialized();
+
+    try {
+      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          flagKey: featureKey,
+          userId: user.userId,
+          userAttributes: user.attributes,
+        }),
+      });
+
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+    } catch (e) {
+      this.debugLog('Failed to evaluate feature flag:', e);
+    }
+
+    return null;
+  }
+
+  /** @internal */
+  async _track(
+    user: UserContext,
     experimentKey: string,
     eventType: EventType,
-    options?: {
-      eventName?: string;
-      eventValue?: number;
-      metadata?: Record<string, unknown>;
-    }
+    options?: TrackOptions
   ): Promise<void> {
     this.ensureInitialized();
-    this.ensureUserId();
 
-    const cached = this.assignments.get(experimentKey);
-    const variantId = cached?.variantId || '';
+    const cached = this.getCachedAssignment(user.userId, experimentKey);
 
     const event: QueuedEvent = {
       id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       experimentId: experimentKey,
-      variantId,
-      userId: this.userId!,
+      // Empty when this user has no assignment here yet; the service then
+      // looks up (or makes) the assignment for this user.
+      variantId: cached?.variantId || '',
+      userId: user.userId,
       eventType,
       eventName: options?.eventName || eventType,
       eventValue: options?.eventValue,
       metadata: options?.metadata,
       timestamp: new Date().toISOString(),
-      retryCount: 0,
     };
 
     if (this.eventQueue.length >= this.syncConfig.maxOfflineEvents) {
       this.eventQueue.shift();
     }
-
     this.eventQueue.push(event);
 
-    if (this.config?.debug) {
-      console.log(
-        `RiviumAbTesting: Queued ${eventType} event for experiment ${experimentKey}`
-      );
-    }
+    this.debugLog(`Queued ${eventType} event for experiment ${experimentKey}`);
 
     // Auto-flush if batch is full
     if (this.eventQueue.length >= this.syncConfig.maxBatchSize) {
@@ -827,8 +774,69 @@ export class RiviumAbTestingSDK {
   }
 
   // ============================================
-  // PRIVATE: SYNC
+  // PRIVATE
   // ============================================
+
+  private headers(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'x-api-key': this.config!.apiKey,
+      ...(this.config!.serverSecret ? { 'x-server-secret': this.config!.serverSecret } : {}),
+    };
+  }
+
+  private emit(event: RiviumAbTestingEventType, data: unknown): void {
+    const callbacks = this.listeners.get(event);
+    if (callbacks) {
+      callbacks.forEach((cb) => cb({ type: event, data }));
+    }
+  }
+
+  private debugLog(message: string, detail?: unknown): void {
+    if (this.config?.debug) {
+      if (detail === undefined) console.log(`RiviumAbTesting: ${message}`);
+      else console.log(`RiviumAbTesting: ${message}`, detail);
+    }
+  }
+
+  private ensureInitialized(): void {
+    if (!this.isInitialized) {
+      throw new Error('RiviumAbTesting SDK not initialized. Call init() first.');
+    }
+  }
+
+  private clearState(): void {
+    this.userId = null;
+    this.userAttributes = {};
+    this.cachedExperiments = [];
+    this.assignments.clear();
+    this.eventQueue = [];
+    this.isInitialized = false;
+  }
+
+  private assignmentKey(userId: string, experimentKey: string): string {
+    return `${userId}\u0000${experimentKey}`;
+  }
+
+  private getCachedAssignment(userId: string, experimentKey: string): CachedAssignment | undefined {
+    return this.assignments.get(this.assignmentKey(userId, experimentKey));
+  }
+
+  private cacheAssignment(userId: string, experimentKey: string, assignment: CachedAssignment): void {
+    const key = this.assignmentKey(userId, experimentKey);
+    this.assignments.delete(key);
+    this.assignments.set(key, assignment);
+
+    const max = this.config?.maxCachedAssignments ?? 10000;
+    while (this.assignments.size > max) {
+      const oldest = this.assignments.keys().next().value as string;
+      this.assignments.delete(oldest);
+    }
+  }
+
+  private findExperiment(experimentKey: string): CachedExperiment | undefined {
+    return this.cachedExperiments.find((e) => e.key === experimentKey || e.id === experimentKey);
+  }
 
   private startSyncTimer(): void {
     if (this.syncTimer) clearInterval(this.syncTimer);
@@ -836,6 +844,8 @@ export class RiviumAbTestingSDK {
       () => this.syncEvents().catch(() => {}),
       this.syncConfig.syncIntervalSeconds * 1000
     );
+    // Do not keep a short-lived process (a script, a serverless call) alive.
+    (this.syncTimer as { unref?: () => void }).unref?.();
   }
 
   private async syncEvents(): Promise<void> {
@@ -848,10 +858,7 @@ export class RiviumAbTestingSDK {
 
       const response = await fetch(`${API_URL}/public/sync`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
+        headers: this.headers(),
         body: JSON.stringify({
           events: batch.map((e) => ({
             experimentId: e.experimentId,
@@ -864,33 +871,29 @@ export class RiviumAbTestingSDK {
             timestamp: e.timestamp,
             clientEventId: e.id,
           })),
-          sdkVersion: 'node-0.1.0',
+          sdkVersion: `node-${SDK_VERSION}`,
         }),
       });
 
       if (response.ok) {
-        const result = await response.json() as Record<string, unknown>;
-        const synced = (result.synced as number) || 0;
-
-        this.eventQueue.splice(0, synced);
-
-        const failed = (result.failed as number) || 0;
-        if (failed > 0) {
-          for (let i = 0; i < Math.min(failed, this.eventQueue.length); i++) {
-            this.eventQueue[i].retryCount++;
-            if (this.eventQueue[i].retryCount >= this.syncConfig.maxRetries) {
-              this.eventQueue.splice(i, 1);
-              i--;
-            }
-          }
-        }
+        const result = (await response.json()) as Record<string, unknown>;
+        // The service has taken the whole batch. Events it could not record
+        // (an experiment that no longer exists, say) would fail again, so they
+        // are not retried.
+        this.eventQueue.splice(0, batch.length);
 
         this.emit('syncCompleted', {
-          synced,
-          failed,
+          synced: (result.synced as number) || 0,
+          failed: (result.failed as number) || 0,
           pending: this.eventQueue.length,
         });
+      } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        // The request itself is wrong (bad key, bad secret); retrying the
+        // same events cannot succeed.
+        this.eventQueue.splice(0, batch.length);
+        this.emit('error', { message: `Sync refused: HTTP ${response.status}` });
       }
+      // 429 and 5xx: keep the events and try again on the next tick.
     } catch (e) {
       this.emit('error', { message: `Sync failed: ${e}` });
     } finally {
@@ -898,101 +901,76 @@ export class RiviumAbTestingSDK {
     }
   }
 
-  // ============================================
-  // PRIVATE: EXPERIMENTS
-  // ============================================
-
   private async fetchExperiments(): Promise<void> {
     try {
       const response = await fetch(
-        `${API_URL}/public/init?platform=node&sdkVersion=0.1.0`,
-        {
-          headers: { 'x-api-key': this.config!.apiKey },
-        }
+        `${API_URL}/public/init?platform=node&sdkVersion=${SDK_VERSION}`,
+        { headers: this.headers() }
       );
 
       if (response.ok) {
-        const data = await response.json() as Record<string, unknown>;
+        const data = (await response.json()) as Record<string, unknown>;
 
         const experimentsList = (data.experiments as Array<Record<string, unknown>>) || [];
         this.cachedExperiments = experimentsList.map((e) => ({
           id: e.id as string,
+          key: (e.key as string) || (e.id as string),
           name: e.name as string,
           trafficAllocation: (e.trafficAllocation as number) ?? 100,
           variants: ((e.variants as Array<Record<string, unknown>>) || []).map((v) => ({
             id: v.id as string,
+            key: (v.key as string) || undefined,
             name: v.name as string,
             config: (v.config as Record<string, unknown>) || undefined,
             isControl: (v.isControl as boolean) ?? false,
             trafficSplit: (v.trafficSplit as number) ?? 50,
           })),
-          cachedAt: new Date().toISOString(),
         }));
 
-        if (data.config) {
+        const serverConfig = data.config as Partial<SyncConfig> | undefined;
+        if (serverConfig) {
           this.syncConfig = {
-            ...this.syncConfig,
-            ...(data.config as Partial<SyncConfig>),
+            syncIntervalSeconds: serverConfig.syncIntervalSeconds ?? this.syncConfig.syncIntervalSeconds,
+            maxBatchSize: serverConfig.maxBatchSize ?? this.syncConfig.maxBatchSize,
+            maxOfflineEvents: this.config?.maxQueueSize ?? serverConfig.maxOfflineEvents ?? this.syncConfig.maxOfflineEvents,
           };
           this.startSyncTimer();
         }
 
-        this.emit('experimentsRefreshed', {
-          count: this.cachedExperiments.length,
-        });
-
-        if (this.config?.debug) {
-          console.log(
-            `RiviumAbTesting: Fetched ${this.cachedExperiments.length} experiments`
-          );
-        }
+        this.emit('experimentsRefreshed', { count: this.cachedExperiments.length });
+        this.debugLog(`Fetched ${this.cachedExperiments.length} experiments`);
       }
     } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to fetch experiments:', e);
-      }
-      this.emit('error', {
-        message: `Failed to fetch experiments: ${e}`,
-      });
+      this.debugLog('Failed to fetch experiments:', e);
+      this.emit('error', { message: `Failed to fetch experiments: ${e}` });
     }
   }
 
-  // ============================================
-  // PRIVATE: LOCAL BUCKETING
-  // ============================================
-
-  private getLocalAssignment(
-    experimentKey: string,
-    defaultVariant: string
-  ): string {
-    const experiment = this.cachedExperiments.find(
-      (e) => e.id === experimentKey
-    );
+  private getLocalAssignment(user: UserContext, experimentKey: string, defaultVariant: string): string {
+    const experiment = this.findExperiment(experimentKey);
     if (!experiment) return defaultVariant;
 
-    const bucket = this.getBucket(this.userId!, experimentKey);
+    const bucket = this.getBucket(user.userId, experimentKey);
     if (bucket > experiment.trafficAllocation) {
       const control = experiment.variants.find((v) => v.isControl);
       return control ? control.name : defaultVariant;
     }
 
     let cumulativeSplit = 0;
-    const variantBucket = this.getBucket(
-      this.userId!,
-      `${experimentKey}:variant`
-    );
+    const variantBucket = this.getBucket(user.userId, `${experimentKey}:variant`);
 
     for (const variant of experiment.variants) {
       cumulativeSplit += variant.trafficSplit;
       if (variantBucket <= cumulativeSplit) {
-        this.assignments.set(experimentKey, {
-          experimentId: experimentKey,
+        this.cacheAssignment(user.userId, experimentKey, {
+          experimentId: experiment.id,
           variantId: variant.id,
           variantName: variant.name,
-          assignedAt: new Date().toISOString(),
+          config: variant.config,
         });
 
         this.emit('experimentAssigned', {
+          userId: user.userId,
           experimentKey,
           variantKey: variant.name,
           config: variant.config,

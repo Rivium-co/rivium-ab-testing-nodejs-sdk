@@ -24,38 +24,65 @@ npm install rivium-ab-testing-node
 ## Quick Start
 
 ```typescript
-import { RiviumAbTestingSDK } from 'rivium-ab-testing-node';
+import { RiviumAbTesting } from 'rivium-ab-testing-node';
 
-const sdk = new RiviumAbTestingSDK();
-
-// 1. Initialize
-await sdk.init({
+// 1. Initialize once, when your server starts
+await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
-  debug: true,
+  serverSecret: process.env.RIVIUM_SERVER_SECRET, // from Rivium Console; server only
 });
 
-// 2. Set user
-sdk.setUserId('user-123');
+// 2. In a request handler: one handle per user
+app.get('/checkout', async (req, res) => {
+  const user = RiviumAbTesting.forUser(req.user.id, { plan: req.user.plan });
 
-// 3. Get variant
-const variant = await sdk.getVariant('checkout-redesign');
+  const variant = await user.getVariant('checkout-redesign');
+  // ...render the page for that variant...
 
-// 4. Track conversion
-await sdk.trackConversion('checkout-redesign', 49.99);
+  await user.trackConversion('checkout-redesign', 49.99);
+});
 
-// 5. Flush events
-await sdk.flush();
-
-// 6. Cleanup
-await sdk.destroy();
+// 3. On shutdown: send what is still queued
+await RiviumAbTesting.destroy();
 ```
 
+## Many users on one server
+
+A server answers many users at once. Always go through `forUser(userId)`:
+each handle carries its own user, and assignments are cached per user and
+experiment, so one user's variant is never served to another.
+
+`setUserId()` still works for scripts and single-user processes, but on a
+server two requests would overwrite each other's user. Don't use it there.
+
+## Server secret and user tokens
+
+This SDK runs on your server, so it can prove that with your project's
+**server secret** (`serverSecret` in `init`). The service then trusts the user
+ids you pass, even when your project requires signed user tokens.
+
+Your apps can't hold the secret. They send a short-lived **user token** that
+your server mints for the signed-in user:
+
+```typescript
+app.post('/rivium-token', requireLogin, async (req, res) => {
+  res.json(await RiviumAbTesting.createUserToken(req.session.userId));
+});
+```
+
+Give the app SDK a `tokenProvider` that calls this endpoint. The same token
+works for Rivium Chat and Sync.
+
+**Never put the server secret in an app, a browser bundle, or a public repo.**
+
 ## A/B Testing
+
+The examples below use `user = RiviumAbTesting.forUser(userId)`.
 
 ### Get Variant
 
 ```typescript
-const variant = await sdk.getVariant(
+const variant = await user.getVariant(
   'experiment-key',
   'control' // fallback if offline and no cache
 );
@@ -64,7 +91,7 @@ const variant = await sdk.getVariant(
 ### Get Variant Config
 
 ```typescript
-const config = await sdk.getVariantConfig('experiment-key');
+const config = await user.getVariantConfig('experiment-key');
 const layout = config?.layout;
 const buttonColor = config?.button_color;
 ```
@@ -72,32 +99,32 @@ const buttonColor = config?.button_color;
 ### List Experiments
 
 ```typescript
-const experiments = sdk.getExperiments();
+const experiments = RiviumAbTesting.getExperiments();
 experiments.forEach((exp) => {
   console.log(`${exp.key} [${exp.status}] - ${exp.variants.length} variants`);
 });
 
 // Refresh from server
-await sdk.refreshExperiments();
+await RiviumAbTesting.refreshExperiments();
 ```
 
 ## Feature Flags
 
 ```typescript
 // Check if feature is enabled
-const darkMode = await sdk.isFeatureEnabled('dark-mode');
+const darkMode = await user.isFeatureEnabled('dark-mode');
 
 // Get feature value (string, number, JSON, etc.)
-const maxUpload = await sdk.getFeatureValue('max-upload-size', 10);
+const maxUpload = await user.getFeatureValue('max-upload-size', 10);
 
 // Get all flags
-const flags = await sdk.getFeatureFlags();
+const flags = await RiviumAbTesting.getFeatureFlags();
 flags.forEach((flag) => {
   console.log(`${flag.key}: enabled=${flag.enabled}, rollout=${flag.rolloutPercentage}%`);
 });
 
 // Refresh flags from server
-await sdk.refreshFeatureFlags();
+await RiviumAbTesting.refreshFeatureFlags();
 ```
 
 ## Event Tracking
@@ -106,36 +133,36 @@ Track user interactions with 17 built-in event types:
 
 ```typescript
 // Core events
-await sdk.trackView('experiment-key');
-await sdk.trackClick('experiment-key');
-await sdk.trackConversion('experiment-key', 99.99);
+await user.trackView('experiment-key');
+await user.trackClick('experiment-key');
+await user.trackConversion('experiment-key', 99.99);
 
 // Custom event
-await sdk.trackCustomEvent('experiment-key', 'button_hover', {
+await user.trackCustomEvent('experiment-key', 'button_hover', {
   duration_ms: 1500,
   element: 'cta_button',
 });
 
 // E-commerce events
-await sdk.trackAddToCart('experiment-key', 29.99, 'sku-123', { quantity: 2 });
-await sdk.trackPurchase('experiment-key', 59.99, 'txn-456', { currency: 'USD' });
-await sdk.trackRemoveFromCart('experiment-key', 29.99, 'sku-123');
-await sdk.trackBeginCheckout('experiment-key', 59.99);
+await user.trackAddToCart('experiment-key', 29.99, 'sku-123', { quantity: 2 });
+await user.trackPurchase('experiment-key', 59.99, 'txn-456', { currency: 'USD' });
+await user.trackRemoveFromCart('experiment-key', 29.99, 'sku-123');
+await user.trackBeginCheckout('experiment-key', 59.99);
 
 // Engagement events
-await sdk.trackScroll('experiment-key', 75.0);
-await sdk.trackFormSubmit('experiment-key', 'signup');
-await sdk.trackSearch('experiment-key', 'shoes');
-await sdk.trackShare('experiment-key', 'twitter');
+await user.trackScroll('experiment-key', 75.0);
+await user.trackFormSubmit('experiment-key', 'signup');
+await user.trackSearch('experiment-key', 'shoes');
+await user.trackShare('experiment-key', 'twitter');
 
 // Media events
-await sdk.trackVideoStart('experiment-key', 'vid-001');
-await sdk.trackVideoComplete('experiment-key', 'vid-001');
+await user.trackVideoStart('experiment-key', 'vid-001');
+await user.trackVideoComplete('experiment-key', 'vid-001');
 
 // Auth events
-await sdk.trackSignUp('experiment-key', 'google');
-await sdk.trackLogin('experiment-key', 'email');
-await sdk.trackLogout('experiment-key');
+await user.trackSignUp('experiment-key', 'google');
+await user.trackLogin('experiment-key', 'email');
+await user.trackLogout('experiment-key');
 ```
 
 ### Generic Event Tracking
@@ -143,7 +170,7 @@ await sdk.trackLogout('experiment-key');
 ```typescript
 import { EventType } from 'rivium-ab-testing-node';
 
-await sdk.trackEvent(
+await user.trackEvent(
   'experiment-key',
   EventType.CUSTOM,
   'page_load_time',
@@ -154,16 +181,13 @@ await sdk.trackEvent(
 
 ## User Attributes
 
-Set attributes for targeting rules:
+Pass attributes for targeting rules with the user:
 
 ```typescript
-sdk.setUserId('user-123');
-
-sdk.setUserAttributes({
+const user = RiviumAbTesting.forUser('user-123', {
   plan: 'premium',
   country: 'US',
   age: 28,
-  platform: 'node',
 });
 ```
 
@@ -171,7 +195,7 @@ sdk.setUserAttributes({
 
 ```typescript
 // Listen for SDK events
-sdk.on('experimentAssigned', (event) => {
+RiviumAbTesting.on('experimentAssigned', (event) => {
   console.log('Assigned:', event.data);
 });
 
@@ -180,17 +204,19 @@ sdk.on('experimentAssigned', (event) => {
 // 'featureFlagsRefreshed', 'syncCompleted'
 
 // Unsubscribe
-sdk.off('experimentAssigned', callback);
+RiviumAbTesting.off('experimentAssigned', callback);
 ```
 
 ## Configuration
 
 ```typescript
-await sdk.init({
+await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
-  debug: true,            // Enable debug logging
-  flushInterval: 30000,   // Auto-flush interval in ms (default: 30000)
-  maxQueueSize: 100,      // Max events before auto-flush (default: 100)
+  serverSecret: process.env.RIVIUM_SERVER_SECRET, // optional; required for createUserToken
+  debug: false,                // log to the console (development only)
+  flushInterval: 30000,        // send queued events every N ms (default: 30000)
+  maxQueueSize: 1000,          // events kept while waiting to send (default: 1000)
+  maxCachedAssignments: 10000, // (user, experiment) assignments kept in memory (default: 10000)
 });
 ```
 
@@ -198,13 +224,13 @@ await sdk.init({
 
 ```typescript
 // Refresh experiments from server
-await sdk.refreshExperiments();
+await RiviumAbTesting.refreshExperiments();
 
-// Flush pending events
-await sdk.flush();
+// Send pending events now
+await RiviumAbTesting.flush();
 
-// Destroy SDK (flush + cleanup timers)
-await sdk.destroy();
+// Send pending events and stop timers
+await RiviumAbTesting.destroy();
 ```
 
 ## API Reference
@@ -212,9 +238,11 @@ await sdk.destroy();
 | Method | Description |
 |---|---|
 | `init(config)` | Initialize the SDK |
-| `setUserId(id)` | Set user ID for assignment |
-| `getUserId()` | Get current user ID |
-| `setUserAttributes(attrs)` | Set targeting attributes |
+| `forUser(id, attrs?)` | A handle acting for one user (use per request) |
+| `createUserToken(id)` | Mint a user token for your app (needs `serverSecret`) |
+| `setUserId(id)` | Single-user processes only: set the SDK's own user |
+| `getUserId()` | Get the SDK's own user ID |
+| `setUserAttributes(attrs)` | Single-user processes only: targeting attributes |
 | `getVariant(key)` | Get assigned variant |
 | `getVariantConfig(key)` | Get variant configuration |
 | `isFeatureEnabled(key)` | Check if feature flag is on |

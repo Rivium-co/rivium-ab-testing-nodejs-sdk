@@ -34,6 +34,8 @@ async function main() {
   log('Init', 'Initializing SDK...');
   await sdk.init({
     apiKey: API_KEY,
+    // Your project's server secret: this runs on your server. Never ship it in an app.
+    serverSecret: process.env.RIVIUM_SERVER_SECRET,
     debug: true,
     flushInterval: 10000,
     maxQueueSize: 50,
@@ -42,25 +44,26 @@ async function main() {
 
   await delay(500);
 
-  // ── User Management ──
-  log('User', `Setting user ID: ${TEST_USER_ID}`);
-  sdk.setUserId(TEST_USER_ID);
-  sdk.setUserAttributes({
+  // ── User ──
+  // One handle per user. On a web server, make one per request with that
+  // request's user: users never see each other's variants.
+  log('User', `Acting for user: ${TEST_USER_ID}`);
+  const user = sdk.forUser(TEST_USER_ID, {
     plan: 'premium',
     country: 'US',
     app_version: '1.0.0',
     platform: 'node',
   });
-  log('User', `User ID: ${sdk.getUserId()}`);
+  log('User', `User ID: ${user.userId}`);
 
   await delay(300);
 
   // ── Experiments ──
   log('Experiments', 'Getting variant...');
-  const variant = await sdk.getVariant(TEST_EXPERIMENT_KEY, 'control');
+  const variant = await user.getVariant(TEST_EXPERIMENT_KEY, 'control');
   log('Experiments', `Variant for '${TEST_EXPERIMENT_KEY}': ${variant}`);
 
-  const config = await sdk.getVariantConfig(TEST_EXPERIMENT_KEY);
+  const config = await user.getVariantConfig(TEST_EXPERIMENT_KEY);
   log('Experiments', `Variant config: ${JSON.stringify(config)}`);
 
   const experiments = sdk.getExperiments();
@@ -70,16 +73,16 @@ async function main() {
 
   // ── Core Events ──
   log('Events', 'Tracking core events...');
-  await sdk.trackView(TEST_EXPERIMENT_KEY);
+  await user.trackView(TEST_EXPERIMENT_KEY);
   log('Events', 'Tracked: view');
 
-  await sdk.trackClick(TEST_EXPERIMENT_KEY);
+  await user.trackClick(TEST_EXPERIMENT_KEY);
   log('Events', 'Tracked: click');
 
-  await sdk.trackConversion(TEST_EXPERIMENT_KEY, 29.99);
+  await user.trackConversion(TEST_EXPERIMENT_KEY, 29.99);
   log('Events', 'Tracked: conversion ($29.99)');
 
-  await sdk.trackCustomEvent(TEST_EXPERIMENT_KEY, 'button_hover', {
+  await user.trackCustomEvent(TEST_EXPERIMENT_KEY, 'button_hover', {
     element: 'cta-primary',
     duration_ms: 1500,
   });
@@ -89,36 +92,36 @@ async function main() {
 
   // ── Engagement Events ──
   log('Engagement', 'Tracking engagement events...');
-  await sdk.trackScroll(TEST_EXPERIMENT_KEY, 75, { section: 'pricing' });
+  await user.trackScroll(TEST_EXPERIMENT_KEY, 75, { section: 'pricing' });
   log('Engagement', 'Tracked: scroll (75%)');
 
-  await sdk.trackFormSubmit(TEST_EXPERIMENT_KEY, 'checkout_form', {
+  await user.trackFormSubmit(TEST_EXPERIMENT_KEY, 'checkout_form', {
     fields: 5,
   });
   log('Engagement', 'Tracked: form_submit (checkout_form)');
 
-  await sdk.trackSearch(TEST_EXPERIMENT_KEY, 'node sdk', { results: 12 });
+  await user.trackSearch(TEST_EXPERIMENT_KEY, 'node sdk', { results: 12 });
   log('Engagement', 'Tracked: search (node sdk)');
 
-  await sdk.trackShare(TEST_EXPERIMENT_KEY, 'twitter', { content: 'product' });
+  await user.trackShare(TEST_EXPERIMENT_KEY, 'twitter', { content: 'product' });
   log('Engagement', 'Tracked: share (twitter)');
 
   await delay(300);
 
   // ── E-Commerce Events ──
   log('E-Commerce', 'Tracking e-commerce events...');
-  await sdk.trackAddToCart(TEST_EXPERIMENT_KEY, 49.99, 'prod-456', {
+  await user.trackAddToCart(TEST_EXPERIMENT_KEY, 49.99, 'prod-456', {
     category: 'electronics',
   });
   log('E-Commerce', 'Tracked: add_to_cart ($49.99)');
 
-  await sdk.trackRemoveFromCart(TEST_EXPERIMENT_KEY, 49.99, 'prod-456');
+  await user.trackRemoveFromCart(TEST_EXPERIMENT_KEY, 49.99, 'prod-456');
   log('E-Commerce', 'Tracked: remove_from_cart');
 
-  await sdk.trackBeginCheckout(TEST_EXPERIMENT_KEY, 149.97, { items: 3 });
+  await user.trackBeginCheckout(TEST_EXPERIMENT_KEY, 149.97, { items: 3 });
   log('E-Commerce', 'Tracked: begin_checkout ($149.97)');
 
-  await sdk.trackPurchase(TEST_EXPERIMENT_KEY, 134.97, 'txn-789', {
+  await user.trackPurchase(TEST_EXPERIMENT_KEY, 134.97, 'txn-789', {
     currency: 'USD',
     items: 3,
   });
@@ -128,30 +131,30 @@ async function main() {
 
   // ── Media Events ──
   log('Media', 'Tracking media events...');
-  await sdk.trackVideoStart(TEST_EXPERIMENT_KEY, 'video-onboarding-01');
+  await user.trackVideoStart(TEST_EXPERIMENT_KEY, 'video-onboarding-01');
   log('Media', 'Tracked: video_start');
 
-  await sdk.trackVideoComplete(TEST_EXPERIMENT_KEY, 'video-onboarding-01');
+  await user.trackVideoComplete(TEST_EXPERIMENT_KEY, 'video-onboarding-01');
   log('Media', 'Tracked: video_complete');
 
   await delay(300);
 
   // ── Auth Events ──
   log('Auth', 'Tracking auth events...');
-  await sdk.trackSignUp(TEST_EXPERIMENT_KEY, 'google');
+  await user.trackSignUp(TEST_EXPERIMENT_KEY, 'google');
   log('Auth', 'Tracked: sign_up (google)');
 
-  await sdk.trackLogin(TEST_EXPERIMENT_KEY, 'email');
+  await user.trackLogin(TEST_EXPERIMENT_KEY, 'email');
   log('Auth', 'Tracked: login (email)');
 
-  await sdk.trackLogout(TEST_EXPERIMENT_KEY);
+  await user.trackLogout(TEST_EXPERIMENT_KEY);
   log('Auth', 'Tracked: logout');
 
   await delay(300);
 
   // ── Generic Event ──
   log('Generic', 'Tracking generic event...');
-  await sdk.trackEvent(TEST_EXPERIMENT_KEY, EventType.CUSTOM, 'page_load', 1.5, {
+  await user.trackEvent(TEST_EXPERIMENT_KEY, EventType.CUSTOM, 'page_load', 1.5, {
     route: '/dashboard',
     load_time_ms: 1500,
   });
@@ -162,11 +165,11 @@ async function main() {
   // ── Feature Flags ──
   log('Flags', 'Testing feature flags...');
   for (const key of FLAG_KEYS) {
-    const enabled = await sdk.isFeatureEnabled(key);
+    const enabled = await user.isFeatureEnabled(key);
     log('Flags', `Flag '${key}': ${enabled ? 'ENABLED' : 'DISABLED'}`);
   }
 
-  const darkModeValue = await sdk.getFeatureValue('Dark Mode Settings', 'default');
+  const darkModeValue = await user.getFeatureValue('Dark Mode Settings', 'default');
   log('Flags', `Feature value 'Dark Mode Settings': ${JSON.stringify(darkModeValue)}`);
 
   const allFlags = await sdk.getFeatureFlags();

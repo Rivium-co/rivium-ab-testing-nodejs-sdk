@@ -1,6 +1,6 @@
 {
   "name": "rivium-ab-testing-node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Rivium A/B Testing SDK for Node.js - Server-side experiments, feature flags, and event tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
