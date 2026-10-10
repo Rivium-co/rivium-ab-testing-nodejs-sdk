@@ -1,8 +1,13 @@
-import { createHash } from './hash';
-
 const API_URL = 'https://abtest.rivium.co';
 const AUTH_URL = 'https://auth.rivium.co';
-const SDK_VERSION = '0.2.0';
+const SDK_VERSION = '0.2.2';
+/** Most events kept while they cannot be sent; the oldest are dropped first. */
+const MAX_QUEUED_EVENTS = 1000;
+/** Most events in one request. */
+const MAX_BATCH_SIZE = 100;
+/** Longest pause after repeated failures. */
+const MAX_BACKOFF_MS = 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 15000;
 
 // ============================================
 // TYPES & INTERFACES
@@ -16,12 +21,16 @@ export interface RiviumAbTestingConfig {
    * prove that with the secret; the service then trusts the user ids you pass,
    * even when the project requires signed user tokens. Keep it on the server:
    * never put it in an app or a browser bundle.
+   *
+   * Without it the service refuses assigning variants, tracking events and
+   * evaluating flags: variants and flags come back as your defaults and
+   * events stay in the queue.
    */
   serverSecret?: string;
   debug?: boolean;
   /** How often queued events are sent, in milliseconds. Default 30000. */
   flushInterval?: number;
-  /** Most events kept in memory while waiting to be sent. Default 1000. */
+  /** Most events kept in memory while waiting to be sent. Default and maximum 1000. */
   maxQueueSize?: number;
   /**
    * Most (user, experiment) assignments kept in memory. A server sees many
@@ -401,11 +410,18 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
 
   // Sync
   private syncTimer: ReturnType<typeof setInterval> | null = null;
-  private isSyncing = false;
+  private syncInFlight?: Promise<void>;
+  private syncPausedUntil = 0;
+  private syncFailures = 0;
+  private eventLimitReported = false;
+  // Set by the service (HTTP 429) or after it refused the caller (HTTP 401):
+  // no call for a user before this time.
+  private userCallsPausedUntil = 0;
+  private refusals = 0;
   private syncConfig: SyncConfig = {
     syncIntervalSeconds: 30,
-    maxBatchSize: 100,
-    maxOfflineEvents: 1000,
+    maxBatchSize: MAX_BATCH_SIZE,
+    maxOfflineEvents: MAX_QUEUED_EVENTS,
   };
 
   // ============================================
@@ -417,9 +433,17 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
 
     this.config = config;
 
+    if (!config.serverSecret) {
+      console.warn(
+        'RiviumAbTesting: no serverSecret given to init(). The service refuses assigning ' +
+          'variants, tracking events and evaluating flags without it: variants and flags ' +
+          'will be your defaults and events will not be sent.'
+      );
+    }
+
     const interval = config.flushInterval || 30000;
     this.syncConfig.syncIntervalSeconds = Math.max(1, Math.floor(interval / 1000));
-    if (config.maxQueueSize) this.syncConfig.maxOfflineEvents = config.maxQueueSize;
+    this.syncConfig.maxOfflineEvents = this.queueLimit(config.maxQueueSize);
     this.startSyncTimer();
 
     this.isInitialized = true;
@@ -490,9 +514,8 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       throw new Error('createUserToken() requires serverSecret in init()');
     }
 
-    const response = await fetch(`${AUTH_URL}/users/token`, {
+    const response = await this.send(`${AUTH_URL}/users/token`, {
       method: 'POST',
-      headers: this.headers(),
       body: JSON.stringify(expiresIn === undefined ? { userId } : { userId, expiresIn }),
     });
     if (!response.ok) {
@@ -537,7 +560,7 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, { headers: this.headers() });
+      const response = await this.send(`${API_URL}/public/flags`);
       if (response.ok) {
         const data = (await response.json()) as Record<string, unknown>;
         return (data.flags as FeatureFlag[]) || [];
@@ -553,7 +576,7 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, { headers: this.headers() });
+      const response = await this.send(`${API_URL}/public/flags`);
       if (response.ok) {
         const data = (await response.json()) as Record<string, unknown>;
         this.emit('featureFlagsRefreshed', data);
@@ -570,6 +593,8 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
 
   async flush(): Promise<void> {
     this.ensureInitialized();
+    // A run that is already under way does not include the newest events.
+    await this.syncInFlight;
     await this.syncEvents();
   }
 
@@ -581,7 +606,14 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
 
     // Flush remaining events before destroying
     if (this.eventQueue.length > 0) {
-      await this.syncEvents();
+      await this.syncInFlight;
+      await this.syncEvents().catch(() => {});
+    }
+    if (this.eventQueue.length > 0) {
+      this.emit('error', {
+        message: `${this.eventQueue.length} events were not sent before destroy()`,
+        dropped: this.eventQueue.length,
+      });
     }
 
     this.clearState();
@@ -649,15 +681,15 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       return cached.variantName;
     }
 
+    // The variant always comes from the service; one is never worked out
+    // here. When the service refuses or cannot be reached: the default.
+    if (Date.now() < this.userCallsPausedUntil) return defaultVariant;
+
     try {
-      const response = await fetch(`${API_URL}/public/assign`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({
-          experimentKey,
-          userId: user.userId,
-          ...(Object.keys(user.attributes).length > 0 ? { userAttributes: user.attributes } : {}),
-        }),
+      const response = await this.userRequest('/public/assign', {
+        experimentKey,
+        userId: user.userId,
+        ...(Object.keys(user.attributes).length > 0 ? { userAttributes: user.attributes } : {}),
       });
 
       if (response.ok) {
@@ -678,6 +710,8 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
             experimentKey,
             variantKey: variantName,
             config: data.config,
+            // False: the user sees this variant but is not counted in the experiment.
+            inExperiment: data.inExperiment !== false,
           });
 
           return variantName;
@@ -689,8 +723,7 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       this.debugLog('Failed to get assignment from server:', e);
     }
 
-    // Fallback: local bucketing
-    return this.getLocalAssignment(user, experimentKey, defaultVariant);
+    return defaultVariant;
   }
 
   /** @internal */
@@ -714,15 +747,13 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
   async _evaluateFlag(user: UserContext, featureKey: string): Promise<Record<string, unknown> | null> {
     this.ensureInitialized();
 
+    if (Date.now() < this.userCallsPausedUntil) return null;
+
     try {
-      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({
-          flagKey: featureKey,
-          userId: user.userId,
-          userAttributes: user.attributes,
-        }),
+      const response = await this.userRequest('/public/flag-evaluation', {
+        flagKey: featureKey,
+        userId: user.userId,
+        userAttributes: user.attributes,
       });
 
       if (response.ok) {
@@ -747,7 +778,7 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
     const cached = this.getCachedAssignment(user.userId, experimentKey);
 
     const event: QueuedEvent = {
-      id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
       experimentId: experimentKey,
       // Empty when this user has no assignment here yet; the service then
       // looks up (or makes) the assignment for this user.
@@ -760,10 +791,8 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       timestamp: new Date().toISOString(),
     };
 
-    if (this.eventQueue.length >= this.syncConfig.maxOfflineEvents) {
-      this.eventQueue.shift();
-    }
     this.eventQueue.push(event);
+    this.trimQueue();
 
     this.debugLog(`Queued ${eventType} event for experiment ${experimentKey}`);
 
@@ -783,6 +812,75 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       'x-api-key': this.config!.apiKey,
       ...(this.config!.serverSecret ? { 'x-server-secret': this.config!.serverSecret } : {}),
     };
+  }
+
+  /** One HTTP call with the SDK's headers and a time limit. */
+  private async send(url: string, init: RequestInit = {}): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...init, headers: this.headers(), signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * A call that acts for a user. A 429 and a refused caller (401) both stop
+   * such calls for a while instead of repeating them for every request your
+   * server handles.
+   */
+  private async userRequest(path: string, body: unknown): Promise<Response> {
+    const response = await this.send(`${API_URL}${path}`, { method: 'POST', body: JSON.stringify(body) });
+
+    if (response.status === 429) {
+      const header = response.headers.get('Retry-After');
+      let seconds = header ? Number(header) : NaN;
+      if (header && !Number.isFinite(seconds)) {
+        seconds = (Date.parse(header) - Date.now()) / 1000;
+      }
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        seconds = this.syncConfig.syncIntervalSeconds;
+      }
+      this.userCallsPausedUntil = Math.max(this.userCallsPausedUntil, Date.now() + seconds * 1000);
+    } else if (response.status === 401) {
+      // The service does not accept this caller: a missing or wrong server
+      // secret, or a wrong API key. Say so once, then wait longer each time.
+      const code = await this.errorCode(response);
+      this.refusals++;
+      this.userCallsPausedUntil = Math.max(this.userCallsPausedUntil, Date.now() + this.backoff(this.refusals));
+      if (this.refusals === 1) {
+        this.emit('error', {
+          message: this.config?.serverSecret
+            ? `The service refused the request: HTTP 401${code ? ` (${code})` : ''}. Check apiKey and serverSecret.`
+            : 'The service refused the request: HTTP 401. Set serverSecret in init().',
+          code,
+        });
+      }
+    } else if (response.ok) {
+      this.refusals = 0;
+    }
+    return response;
+  }
+
+  private async errorCode(response: Response): Promise<string | undefined> {
+    const body = (await response.clone().json().catch(() => null)) as { code?: unknown } | null;
+    return typeof body?.code === 'string' ? body.code : undefined;
+  }
+
+  /** The n-th wait after repeated failures: the flush interval, doubling. */
+  private backoff(failures: number): number {
+    return Math.min(this.syncConfig.syncIntervalSeconds * 1000 * 2 ** (failures - 1), MAX_BACKOFF_MS);
+  }
+
+  private queueLimit(wanted?: number): number {
+    return wanted && wanted > 0 ? Math.min(wanted, MAX_QUEUED_EVENTS) : MAX_QUEUED_EVENTS;
+  }
+
+  /** Keeps the queue within its limit; the oldest events go first. */
+  private trimQueue(): void {
+    const over = this.eventQueue.length - this.syncConfig.maxOfflineEvents;
+    if (over > 0) this.eventQueue.splice(0, over);
   }
 
   private emit(event: RiviumAbTestingEventType, data: unknown): void {
@@ -812,6 +910,11 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
     this.assignments.clear();
     this.eventQueue = [];
     this.isInitialized = false;
+    this.syncPausedUntil = 0;
+    this.syncFailures = 0;
+    this.eventLimitReported = false;
+    this.userCallsPausedUntil = 0;
+    this.refusals = 0;
   }
 
   private assignmentKey(userId: string, experimentKey: string): string {
@@ -848,65 +951,104 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
     (this.syncTimer as { unref?: () => void }).unref?.();
   }
 
-  private async syncEvents(): Promise<void> {
-    if (this.isSyncing || this.eventQueue.length === 0) return;
+  /** Sends the queue. One run at a time; a second caller gets the same run. */
+  private syncEvents(): Promise<void> {
+    if (this.syncInFlight) return this.syncInFlight;
+    const run = this.runSync().finally(() => {
+      if (this.syncInFlight === run) this.syncInFlight = undefined;
+    });
+    this.syncInFlight = run;
+    return run;
+  }
 
-    this.isSyncing = true;
+  private async runSync(): Promise<void> {
+    // What is queued now; events recorded during the run go with the next one.
+    let left = this.eventQueue.length;
+    while (left > 0 && this.eventQueue.length > 0) {
+      const now = Date.now();
+      if (now < this.syncPausedUntil || now < this.userCallsPausedUntil) return;
+
+      const batch = this.eventQueue.slice(0, Math.min(this.syncConfig.maxBatchSize, left));
+      if (!(await this.sendBatch(batch))) return;
+      left -= batch.length;
+    }
+  }
+
+  /** Sends one batch. True when the queue can go on to the next one. */
+  private async sendBatch(batch: QueuedEvent[]): Promise<boolean> {
+    const ids = new Set(batch.map((e) => e.id));
+    const done = () => {
+      this.eventQueue = this.eventQueue.filter((e) => !ids.has(e.id));
+    };
 
     try {
-      const batch = this.eventQueue.slice(0, this.syncConfig.maxBatchSize);
-
-      const response = await fetch(`${API_URL}/public/sync`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({
-          events: batch.map((e) => ({
-            experimentId: e.experimentId,
-            variantId: e.variantId,
-            userId: e.userId,
-            eventType: e.eventType,
-            eventName: e.eventName,
-            eventValue: e.eventValue,
-            metadata: e.metadata,
-            timestamp: e.timestamp,
-            clientEventId: e.id,
-          })),
-          sdkVersion: `node-${SDK_VERSION}`,
-        }),
+      const response = await this.userRequest('/public/sync', {
+        events: batch.map((e) => ({
+          experimentId: e.experimentId,
+          variantId: e.variantId,
+          userId: e.userId,
+          eventType: e.eventType,
+          eventName: e.eventName,
+          eventValue: e.eventValue,
+          metadata: e.metadata,
+          timestamp: e.timestamp,
+          clientEventId: e.id,
+        })),
+        sdkVersion: `node-${SDK_VERSION}`,
       });
 
       if (response.ok) {
-        const result = (await response.json()) as Record<string, unknown>;
+        const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
         // The service has taken the whole batch. Events it could not record
         // (an experiment that no longer exists, say) would fail again, so they
         // are not retried.
-        this.eventQueue.splice(0, batch.length);
+        done();
+        this.syncFailures = 0;
+        this.eventLimitReported = false;
 
         this.emit('syncCompleted', {
           synced: (result.synced as number) || 0,
           failed: (result.failed as number) || 0,
           pending: this.eventQueue.length,
         });
-      } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        // The request itself is wrong (bad key, bad secret); retrying the
-        // same events cannot succeed.
-        this.eventQueue.splice(0, batch.length);
-        this.emit('error', { message: `Sync refused: HTTP ${response.status}` });
+        return true;
       }
-      // 429 and 5xx: keep the events and try again on the next tick.
+
+      // 429 and 401: the events stay in the (bounded) queue; userRequest has
+      // set how long to wait and reported a refusal.
+      if (response.status === 429 || response.status === 401) return false;
+
+      if (response.status >= 500) {
+        this.syncPausedUntil = Date.now() + this.backoff(++this.syncFailures);
+        this.emit('error', { message: `Sync failed: HTTP ${response.status}` });
+        return false;
+      }
+
+      if (response.status === 403 && (await this.errorCode(response)) === 'event_limit_reached') {
+        // The plan's events are used up. Keep the queue, try once per
+        // interval, and say so once.
+        this.syncPausedUntil = Date.now() + this.syncConfig.syncIntervalSeconds * 1000;
+        if (!this.eventLimitReported) {
+          this.eventLimitReported = true;
+          this.emit('error', { message: 'Event limit reached', code: 'event_limit_reached' });
+        }
+        return false;
+      }
+
+      // The request itself is wrong; the same events cannot succeed.
+      done();
+      this.emit('error', { message: `Sync refused: HTTP ${response.status}`, dropped: batch.length });
+      return true;
     } catch (e) {
+      this.syncPausedUntil = Date.now() + this.backoff(++this.syncFailures);
       this.emit('error', { message: `Sync failed: ${e}` });
-    } finally {
-      this.isSyncing = false;
+      return false;
     }
   }
 
   private async fetchExperiments(): Promise<void> {
     try {
-      const response = await fetch(
-        `${API_URL}/public/init?platform=node&sdkVersion=${SDK_VERSION}`,
-        { headers: this.headers() }
-      );
+      const response = await this.send(`${API_URL}/public/init?platform=node&sdkVersion=${SDK_VERSION}`);
 
       if (response.ok) {
         const data = (await response.json()) as Record<string, unknown>;
@@ -929,12 +1071,18 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
 
         const serverConfig = data.config as Partial<SyncConfig> | undefined;
         if (serverConfig) {
+          const interval = this.syncConfig.syncIntervalSeconds;
           this.syncConfig = {
-            syncIntervalSeconds: serverConfig.syncIntervalSeconds ?? this.syncConfig.syncIntervalSeconds,
-            maxBatchSize: serverConfig.maxBatchSize ?? this.syncConfig.maxBatchSize,
-            maxOfflineEvents: this.config?.maxQueueSize ?? serverConfig.maxOfflineEvents ?? this.syncConfig.maxOfflineEvents,
+            syncIntervalSeconds: serverConfig.syncIntervalSeconds ?? interval,
+            maxBatchSize: Math.max(1, Math.min(serverConfig.maxBatchSize ?? this.syncConfig.maxBatchSize, MAX_BATCH_SIZE)),
+            maxOfflineEvents: this.queueLimit(
+              this.config?.maxQueueSize ?? serverConfig.maxOfflineEvents ?? this.syncConfig.maxOfflineEvents
+            ),
           };
-          this.startSyncTimer();
+          this.trimQueue();
+          if (this.isInitialized && this.syncConfig.syncIntervalSeconds !== interval) {
+            this.startSyncTimer();
+          }
         }
 
         this.emit('experimentsRefreshed', { count: this.cachedExperiments.length });
@@ -944,49 +1092,6 @@ export class RiviumAbTestingSDK extends RiviumAbTestingClient {
       this.debugLog('Failed to fetch experiments:', e);
       this.emit('error', { message: `Failed to fetch experiments: ${e}` });
     }
-  }
-
-  private getLocalAssignment(user: UserContext, experimentKey: string, defaultVariant: string): string {
-    const experiment = this.findExperiment(experimentKey);
-    if (!experiment) return defaultVariant;
-
-    const bucket = this.getBucket(user.userId, experimentKey);
-    if (bucket > experiment.trafficAllocation) {
-      const control = experiment.variants.find((v) => v.isControl);
-      return control ? control.name : defaultVariant;
-    }
-
-    let cumulativeSplit = 0;
-    const variantBucket = this.getBucket(user.userId, `${experimentKey}:variant`);
-
-    for (const variant of experiment.variants) {
-      cumulativeSplit += variant.trafficSplit;
-      if (variantBucket <= cumulativeSplit) {
-        this.cacheAssignment(user.userId, experimentKey, {
-          experimentId: experiment.id,
-          variantId: variant.id,
-          variantName: variant.name,
-          config: variant.config,
-        });
-
-        this.emit('experimentAssigned', {
-          userId: user.userId,
-          experimentKey,
-          variantKey: variant.name,
-          config: variant.config,
-        });
-
-        return variant.name;
-      }
-    }
-
-    return defaultVariant;
-  }
-
-  private getBucket(userId: string, salt: string): number {
-    const hash = createHash(`${userId}:${salt}`);
-    const hashInt = parseInt(hash.substring(0, 8), 16);
-    return (hashInt % 100) + 1;
   }
 }
 

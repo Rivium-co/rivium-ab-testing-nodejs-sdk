@@ -13,7 +13,7 @@ Server-side A/B Testing and Feature Flags SDK for Node.js.
 - Event queue with automatic batch sync
 - 17 built-in event types (view, click, conversion, purchase, etc.)
 - Dual CJS/ESM output with full TypeScript types
-- Node.js 16+
+- Node.js 18+
 
 ## Installation
 
@@ -61,6 +61,11 @@ This SDK runs on your server, so it can prove that with your project's
 **server secret** (`serverSecret` in `init`). The service then trusts the user
 ids you pass, even when your project requires signed user tokens.
 
+Without `serverSecret` the service refuses assigning variants, tracking events
+and evaluating flags. `init()` warns about it; variants and flags then come
+back as your defaults, events stay in the queue (at most 1000), and the
+refusal is reported once through the `error` event.
+
 Your apps can't hold the secret. They send a short-lived **user token** that
 your server mints for the signed-in user:
 
@@ -84,7 +89,7 @@ The examples below use `user = RiviumAbTesting.forUser(userId)`.
 ```typescript
 const variant = await user.getVariant(
   'experiment-key',
-  'control' // fallback if offline and no cache
+  'control' // returned when the service refuses or cannot be reached and nothing is cached
 );
 ```
 
@@ -212,10 +217,10 @@ RiviumAbTesting.off('experimentAssigned', callback);
 ```typescript
 await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
-  serverSecret: process.env.RIVIUM_SERVER_SECRET, // optional; required for createUserToken
+  serverSecret: process.env.RIVIUM_SERVER_SECRET, // required for variants, events, flags and createUserToken
   debug: false,                // log to the console (development only)
   flushInterval: 30000,        // send queued events every N ms (default: 30000)
-  maxQueueSize: 1000,          // events kept while waiting to send (default: 1000)
+  maxQueueSize: 1000,          // events kept while waiting to send (default and maximum: 1000)
   maxCachedAssignments: 10000, // (user, experiment) assignments kept in memory (default: 10000)
 });
 ```
