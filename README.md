@@ -219,7 +219,7 @@ await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
   serverSecret: process.env.RIVIUM_SERVER_SECRET, // required for variants, events, flags and createUserToken
   debug: false,                // log to the console (development only)
-  flushInterval: 30000,        // send queued events every N ms (default: 30000)
+  flushInterval: 30000,        // send queued events every N ms. Leave it out to follow the send interval set in the Rivium console
   maxQueueSize: 1000,          // events kept while waiting to send (default and maximum: 1000)
   maxCachedAssignments: 10000, // (user, experiment) assignments kept in memory (default: 10000)
 });
